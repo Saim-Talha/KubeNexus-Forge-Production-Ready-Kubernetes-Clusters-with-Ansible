@@ -1,0 +1,64 @@
+---
+# roles/lb/tasks/main.yml
+- name: Install haproxy and keepalived
+  package:
+    name:
+      - haproxy
+      - keepalived
+    state: present
+
+- name: Configure haproxy for kube-apiserver LB
+  copy:
+    dest: /etc/haproxy/haproxy.cfg
+    content: |
+      global
+        daemon
+        maxconn 256
+      defaults
+        mode tcp
+        timeout connect 10s
+        timeout client 1m
+        timeout server 1m
+      frontend kube-apiserver-front
+        bind *:6443
+        default_backend kube-apiserver-back
+      backend kube-apiserver-back
+        mode tcp
+{% for host in groups['masters'] %}
+        server {{ host }} {{ hostvars[host]['ansible_host'] | default(host) }}:6443 check
+{% endfor %}
+  notify: restart haproxy
+
+- name: Configure keepalived for VIP
+  copy:
+    dest: /etc/keepalived/keepalived.conf
+    content: |
+      vrrp_instance VI_1 {
+        state MASTER
+        interface {{ lb_iface }}
+        virtual_router_id 51
+        priority 100
+        advert_int 1
+        authentication {
+          auth_type PASS
+          auth_pass kubevippass
+        }
+        virtual_ipaddress {
+          {{ api_vip }}
+        }
+      }
+  notify: restart keepalived
+
+handlers:
+  - name: restart haproxy
+    service:
+      name: haproxy
+      state: restarted
+      enabled: yes
+
+  - name: restart keepalived
+    service:
+      name: keepalived
+      state: restarted
+      enabled: yes
+

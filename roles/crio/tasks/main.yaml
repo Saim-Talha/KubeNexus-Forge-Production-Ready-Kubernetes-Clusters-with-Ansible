@@ -1,0 +1,103 @@
+---
+# Role: crio
+# Purpose: Install and configure CRI-O runtime on AlmaLinux 9 (stable & tested)
+
+# Set a primary WHEN condition to ensure this role only runs on the intended
+# cluster nodes, avoiding the duplicate run on '159.69.207.152'.
+#- name: Clean old repos and caches
+#  file:
+#    path: /etc/yum.repos.d/cri-o.repo
+#    state: absent
+#  ignore_errors: yes
+#  when: inventory_hostname in groups['masters'] or inventory_hostname in groups['workers']
+
+- name: Create CRI-O repo file
+  copy:
+    dest: /etc/yum.repos.d/crio.repo
+    content: |
+      [cri-o]
+      name=CRI-O stable stream
+      baseurl={{ crio_repo_url }}
+      enabled=1
+      gpgcheck=0
+  when: inventory_hostname in groups['masters'] or inventory_hostname in groups['workers']
+
+- name: Install CRI-O
+  package:
+    name: cri-o
+    state: present
+  register: crio_install
+  when: inventory_hostname in groups['masters'] or inventory_hostname in groups['workers']
+
+- name: Install cri-tools (crictl) manually
+  shell: |
+    curl -L https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.30.0/crictl-v1.30.0-linux-amd64.tar.gz -o /tmp/crictl.tar.gz
+    tar -C /usr/local/bin -xzf /tmp/crictl.tar.gz
+    chmod +x /usr/local/bin/crictl
+  args:
+    creates: /usr/local/bin/crictl
+  when: inventory_hostname in groups['masters'] or inventory_hostname in groups['workers']
+
+- name: Ensure /etc/crio directory exists
+  file:
+    path: /etc/crio
+    state: directory
+    mode: '0755'
+  when: inventory_hostname in groups['masters'] or inventory_hostname in groups['workers']
+
+- name: Configure CRI-O cgroup driver (systemd)
+  copy:
+    dest: /etc/crio/crio.conf
+    content: |
+      [crio.runtime]
+      runtime_path = "/usr/bin/runc"
+      [crio.runtime.runtimes.runc]
+      runtime_type = "io.containerd.runc.v2"
+      [crio.runtime.runtimes.runc.options]
+        SystemdCgroup = true
+  notify: Restart crio
+  when: inventory_hostname in groups['masters'] or inventory_hostname in groups['workers']
+
+- name: Ensure /etc/containers/registries.conf exists (minimal)
+  copy:
+    dest: /etc/containers/registries.conf
+    content: |
+      unqualified-search-registries = ["registry.access.redhat.com", "docker.io"]
+  ignore_errors: yes
+  when: inventory_hostname in groups['masters'] or inventory_hostname in groups['workers']
+
+- name: Fix invalid runtime_type for CRI-O on AlmaLinux
+  lineinfile:
+    path: /etc/crio/crio.conf
+    regexp: '^runtime_type = "io.containerd.runc.v2"'
+    line: 'runtime_type = ""'
+  notify: Restart crio
+  when: inventory_hostname in groups['masters'] or inventory_hostname in groups['workers']
+
+- name: Enable and start crio
+  service:
+    name: crio
+    state: started
+    enabled: yes
+  when: inventory_hostname in groups['masters'] or inventory_hostname in groups['workers']
+
+- name: Ensure br_netfilter modules loaded
+  modprobe:
+    name: br_netfilter
+    state: present
+  when: inventory_hostname in groups['masters'] or inventory_hostname in groups['workers']
+
+- name: Ensure required sysctl for k8s
+  sysctl:
+    name: "{{ item.name }}"
+    value: "{{ item.value }}"
+    state: present
+    reload: yes
+  loop:
+    - { name: 'net.bridge.bridge-nf-call-iptables', value: 1 }
+    - { name: 'net.bridge.bridge-nf-call-ip6tables', value: 1 }
+    - { name: 'net.ipv4.ip_forward', value: 1 }
+  when: inventory_hostname in groups['masters'] or inventory_hostname in groups['workers']
+
+# You had a duplicate handler task at the end of the original file. 
+# Handlers are only run when notified, so I've removed the duplicate task here.

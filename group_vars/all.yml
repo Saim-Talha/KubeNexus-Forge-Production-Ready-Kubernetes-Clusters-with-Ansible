@@ -1,0 +1,22 @@
+# group_vars/all.yml
+kube_version: "v1.30.14"     # Kubernetes version (kubeadm/kubelet/kubectl RPM suffix)
+
+pod_network_cidr: "192.168.0.0/16" #Pod cidr 
+service_network_cidr: "10.96.0.0/12" #service network CIDRs
+
+use_deployer_lb: true #use_deployer_lb: whether to use deployer node as LB
+lb_iface: "eth0"                   # interface on deployer for keepalived
+
+crio_repo_url: "https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable:/cri-o:/1.27:/1.27.0/CentOS_9_Stream/" #crio_repo_url: CRI-O YUM repo URL
+crio_repo_key: "https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable:/cri-o:/1.27:/1.27.0/CentOS_9_Stream/repodata/repomd.xml.key" #crio_repo_key: CRI-O repo GPG key URL
+oc_client_url: "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/latest/openshift-client-linux.tar.gz" ## oc_client_url: URL to download OKD 'oc' client binary
+
+cri_socket: "/var/run/crio/crio.sock"  ## cri_socket: path to CRI-O socket for crictl
+k8s_advertise_address: "159.69.207.152"  
+
+k8s_api_endpoint_ip: "203.0.113.1"   # CP1/deployer Pub IP 
+k8s_control_plane_ip: "203.0.113.1"  # CP1/deployer Pub IP
+k8s_pod_network_cidr: "203.0.113.1" #CP1/deployer Pub IP
+
+k8s_version: "1.27.0" # Kubernetes version for kubeadm init
+

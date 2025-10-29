@@ -1,0 +1,55 @@
+---
+# Role: kube
+# Purpose: Install and configure Kubernetes components
+
+# Define a primary WHEN condition to ensure this role only runs on the intended
+# cluster nodes, avoiding the duplicate run on '159.69.207.152'.
+# This condition will be added to ALL subsequent tasks.
+- name: Ensure required packages are installed
+  ansible.builtin.package: 
+    name: 
+      - curl 
+      - yum-utils
+      - device-mapper-persistent-data 
+      - lvm2 
+    state: present
+  when: inventory_hostname in groups['masters'] or inventory_hostname in groups['workers']
+
+- name: Remove any stale Kubernetes repo files
+  ansible.builtin.file:
+    path: /etc/yum.repos.d/kubernetes.repo
+    state: absent
+  when: inventory_hostname in groups['masters'] or inventory_hostname in groups['workers']
+
+- name: Add official Kubernetes repo (v1.27)
+  ansible.builtin.copy:
+    dest: /etc/yum.repos.d/kubernetes.repo
+    content: |
+      [kubernetes]
+      name=Kubernetes v1.27
+      baseurl=https://pkgs.k8s.io/core:/stable:/v1.27/rpm/
+      enabled=1
+      gpgcheck=1
+      gpgkey=https://pkgs.k8s.io/core:/stable:/v1.27/rpm/repodata/repomd.xml.key
+    owner: root
+    group: root
+    mode: '0644'
+  when: inventory_hostname in groups['masters'] or inventory_hostname in groups['workers']
+
+
+- name: Install Kubernetes components (v1.27)
+  ansible.builtin.dnf:
+    name:
+      - kubelet
+      - kubeadm
+      - kubectl
+    state: present
+    disable_gpg_check: true
+  when: inventory_hostname in groups['masters'] or inventory_hostname in groups['workers']
+
+- name: Enable and start kubelet service
+  ansible.builtin.systemd:
+    name: kubelet
+    enabled: true
+    state: started
+  when: inventory_hostname in groups['masters'] or inventory_hostname in groups['workers']

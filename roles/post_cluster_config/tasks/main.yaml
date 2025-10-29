@@ -1,0 +1,163 @@
+---
+# Role: post_cluster_config
+# Purpose: Fix repo, DNF, kubelet/CRI-O, CoreDNS, and CNI (Calico) issues on AlmaLinux 9 clusters
+
+##########################
+# Repo Repair
+##########################
+- name: Remove duplicate AlmaLinux repo files
+  ansible.builtin.shell: |
+    find /etc/yum.repos.d -type f -name "*.repo" | \
+    grep -E "(BaseOS|AppStream|Extras|baseos|appstream|extras)" | \
+    grep -v "almalinux.repo" | xargs -r rm -f
+  when: inventory_hostname in groups['masters'] or inventory_hostname in groups['workers']
+
+- name: Restore official AlmaLinux 9.6 repos
+  ansible.builtin.copy:
+    dest: /etc/yum.repos.d/almalinux.repo
+    content: |
+      [baseos]
+      name=AlmaLinux 9.6 - BaseOS
+      baseurl=https://repo.almalinux.org/almalinux/9.6/BaseOS/x86_64/os/
+      enabled=1
+      gpgcheck=1
+      gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux
+
+      [appstream]
+      name=AlmaLinux 9.6 - AppStream
+      baseurl=https://repo.almalinux.org/almalinux/9.6/AppStream/x86_64/os/
+      enabled=1
+      gpgcheck=1
+      gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux
+
+      [extras]
+      name=AlmaLinux 9.6 - Extras
+      baseurl=https://repo.almalinux.org/almalinux/9.6/extras/x86_64/os/
+      enabled=1
+      gpgcheck=1
+      gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux
+  when: inventory_hostname in groups['masters'] or inventory_hostname in groups['workers']
+
+##########################
+# Kubelet & CRI-O Service Health
+##########################
+- name: Restart kubelet and CRI-O on all nodes
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: restarted
+    enabled: true
+  loop:
+    - crio
+    - kubelet
+  when: inventory_hostname in groups['masters'] or inventory_hostname in groups['workers']
+
+- name: Wait for kubelet service to reconnect
+  ansible.builtin.shell: |
+    sleep 10
+    systemctl is-active kubelet
+  register: kubelet_status
+  changed_when: false
+  when: inventory_hostname in groups['masters'] or inventory_hostname in groups['workers']
+
+- name: Show kubelet service status
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }} kubelet status: {{ kubelet_status.stdout }}"
+  when: inventory_hostname in groups['masters'] or inventory_hostname in groups['workers']
+
+##########################
+# Certs & CoreDNS Repair (masters only)
+##########################
+- name: Sync Kubernetes CA certs
+  when: inventory_hostname in groups['masters']
+  ansible.builtin.copy:
+    src: /etc/kubernetes/pki/ca.crt
+    dest: /etc/pki/ca-trust/source/anchors/kubernetes-ca.crt
+    remote_src: true
+    mode: '0644'
+
+- name: Update CA trust
+  when: inventory_hostname in groups['masters']
+  ansible.builtin.command: update-ca-trust extract
+
+- name: Restart Calico pods (if exist)
+  when: inventory_hostname in groups['masters']
+  ansible.builtin.shell: |
+    export KUBECONFIG=/etc/kubernetes/admin.conf
+    kubectl delete pods -n kube-system -l k8s-app=calico-node --force --grace-period=0 || true
+  ignore_errors: yes
+
+- name: Restart CoreDNS pods
+  when: inventory_hostname in groups['masters']
+  ansible.builtin.shell: |
+    export KUBECONFIG=/etc/kubernetes/admin.conf
+    kubectl delete pods -n kube-system -l k8s-app=kube-dns --force --grace-period=0 || true
+  ignore_errors: yes
+
+- name: Wait for CoreDNS to recover
+  when: inventory_hostname in groups['masters']
+  ansible.builtin.shell: |
+    export KUBECONFIG=/etc/kubernetes/admin.conf
+    kubectl rollout status deployment/coredns -n kube-system --timeout=180s
+  register: coredns_status
+  failed_when: "'successfully rolled out' not in coredns_status.stdout"
+  ignore_errors: yes
+
+##########################
+# Calico CNI Deployment (First Master Only)
+##########################
+- name: Deploy Calico CNI using a standard manifest
+  when: inventory_hostname == groups['masters'][0]
+  block:
+    - name: Apply Calico manifest (v3.27)
+      ansible.builtin.shell: |
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        # Using a standard manifest for simpler installation than the operator
+        kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/calico.yaml
+      register: calico_deploy_status
+      # If the CNI is already deployed (from previous manual steps), this will show 'unchanged' but won't fail
+      changed_when: "'created' in calico_deploy_status.stdout or 'configured' in calico_deploy_status.stdout"
+      ignore_errors: yes
+
+    - name: Wait for Calico pods to become ready
+      ansible.builtin.shell: |
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        # Wait for calico-node daemonset and calico-kube-controllers deployment
+        kubectl rollout status ds/calico-node -n kube-system --timeout=300s
+        kubectl rollout status deploy/calico-kube-controllers -n kube-system --timeout=300s
+      register: calico_wait
+      changed_when: false
+      ignore_errors: yes
+
+- name: Restart CoreDNS pods to pick up new CNI
+  # This ensures CoreDNS gets a fresh start with the new network
+  when: inventory_hostname in groups['masters'] and groups['masters'] | length >= 1
+  ansible.builtin.shell: |
+    export KUBECONFIG=/etc/kubernetes/admin.conf
+    kubectl delete pods -n kube-system -l k8s-app=kube-dns --force --grace-period=0 || true
+  ignore_errors: yes
+
+##########################
+# Final Cluster Health Wait
+##########################
+- name: Wait until all nodes are Ready
+  when: inventory_hostname == groups['masters'][0]
+  ansible.builtin.shell: |
+    export KUBECONFIG=/etc/kubernetes/admin.conf
+    kubectl wait --for=condition=Ready nodes --all --timeout=300s
+  register: node_ready_status
+  changed_when: false
+  ignore_errors: yes
+
+- name: Show final node readiness
+  when: inventory_hostname == groups['masters'][0]
+  ansible.builtin.shell: |
+    export KUBECONFIG=/etc/kubernetes/admin.conf
+    kubectl get nodes -o wide
+  register: final_nodes
+  changed_when: false
+
+- name: Display final cluster nodes
+  when: inventory_hostname == groups['masters'][0]
+  ansible.builtin.debug:
+    msg: "{{ final_nodes.stdout_lines }}"
+

@@ -1,0 +1,153 @@
+
+# site-alma.yml
+# Top-level playbook to deploy an "OKD-like" stack on AlmaLinux 9 using kubeadm + CRI-O.
+#
+# Inventory groups expected:
+#  - deployer    (where HAProxy/keepalived optional LB runs; also where you run ansible)
+#  - masters     (3 master hostnames)
+#  - workers     (3 worker hostnames)
+#  - cluster: children (masters + workers)
+#
+# Usage:
+# ansible-playbook -i hosts.ini site-alma.yml
+
+# site-alma.yml
+# Sequential OKD-like deployment on AlmaLinux 9
+# Any task failure stops the playbook immediately
+---
+- name: 0. Prepare all nodes (install prerequisites & CRI-O)
+  hosts: all
+  become: true
+  gather_facts: true
+  any_errors_fatal: true   # Fail the whole playbook if any host fails
+  roles:
+    - role: crio
+    - role: kube
+
+- name: 1. Pre-flight cleanup on first master (ports, CRI-O)
+  hosts: "{{ groups['masters'][0] }}"
+  become: true
+  gather_facts: true
+  any_errors_fatal: true
+  tasks:
+    - name: Stop kubelet and CRI-O
+      systemd:
+        name: "{{ item }}"
+        state: stopped
+      loop:
+        - kubelet
+        - crio
+
+    - name: Kill processes on Kubernetes ports
+      shell: |
+        for port in 6443 10250 10257 10259 2379 2380; do
+          pid=$(ss -tuln | grep ":$port " | awk '{print $6}' | cut -d',' -f2)
+          if [ -n "$pid" ]; then
+            kill -9 $pid || true
+          fi
+        done
+      ignore_errors: yes
+
+    - name: Remove old manifests and data
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/kubernetes/manifests/*
+        - /var/lib/etcd
+        - /var/lib/kubelet
+        - /var/lib/cni
+        - /var/lib/kubelet/*
+
+    - name: Remove leftover CRI-O containers
+      shell: |
+        crictl --runtime-endpoint unix:///var/run/crio/crio.sock ps -aq | xargs -r crictl --runtime-endpoint unix:///var/run/crio/crio.sock rm -f
+      ignore_errors: yes
+
+    - name: Start and enable CRI-O
+      systemd:
+        name: crio
+        state: started
+        enabled: yes
+
+    - name: Verify CRI-O socket
+      stat:
+        path: /var/run/crio/crio.sock
+      register: crio_socket
+
+    - name: Fail if CRI-O socket not found
+      fail:
+        msg: "CRI-O is not running or socket missing!"
+      when: not crio_socket.stat.exists
+
+- name: 2. Initialize first control-plane (master0)
+  hosts: "{{ groups['masters'][0] }}"
+  become: true
+  gather_facts: true
+  any_errors_fatal: true
+  roles:
+    - role: master_init
+      vars:
+        run_once_on_master0: true
+
+- name: 3. Join remaining control-planes
+  hosts: "{{ groups['masters'][1:] }}"
+  become: true
+  gather_facts: true
+  any_errors_fatal: true
+  roles:
+    - role: worker_join
+      vars:
+        join_as_control_plane: true
+
+- name: 4. Join worker nodes
+  hosts: workers
+  become: true
+  gather_facts: true
+  any_errors_fatal: true
+  roles:
+    - role: worker_join
+      vars:
+        join_as_control_plane: false
+
+- name: 5. Deploy OKD operators
+  hosts: deployer
+  become: true
+  gather_facts: true
+  any_errors_fatal: true
+  roles:
+    - role: okd_ops
+
+- name: 6. Final verification (wait for nodes & report)
+  hosts: "{{ groups['masters'][0] }}"
+  become: true
+  gather_facts: true
+  any_errors_fatal: true
+  tasks:
+    - name: Ensure kubectl is available
+      command: test -x /usr/bin/kubectl
+      register: kubectl_test
+      failed_when: kubectl_test.rc != 0
+
+    - name: Wait for all nodes ready
+      shell: |
+        export KUBECONFIG=/root/admin.conf
+        kubectl get nodes --no-headers | awk '{print $2}' | grep -v Ready || true
+      register: not_ready
+      retries: 20
+      delay: 15
+      until: not_ready.stdout == ""
+      failed_when: false
+
+    - name: Print kubeconfig path
+      debug:
+        msg: "Kubeconfig for admin: /root/admin.conf (on first master and deployer)."
+
+- name: 7 Ensuring cluster health (DNF + CoreDNS + node readiness)
+  hosts: all
+  become: true
+  gather_facts: true
+  any_errors_fatal: true
+  roles:
+    - role: post_cluster_config 
+

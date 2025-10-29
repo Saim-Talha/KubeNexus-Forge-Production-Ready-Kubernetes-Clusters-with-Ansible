@@ -1,0 +1,6 @@
+---
+- name: Restart crio
+  service:
+    name: crio
+    state: restarted
+

@@ -1,0 +1,109 @@
+# roles/worker_join/tasks/main.yml
+# --------------------------------------------------------------------
+# Join remaining masters and workers to existing control-plane
+# Compatible with Ansible 2.15+ and Kubernetes v1.28+
+# --------------------------------------------------------------------
+
+- name: Ensure node is clean before join
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: stopped
+  loop:
+    - kubelet
+    - crio
+  ignore_errors: yes
+
+- name: Reset kubeadm cluster if exists
+  ansible.builtin.command: kubeadm reset -f
+  ignore_errors: yes
+
+- name: Clean Kubernetes directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/kubernetes/manifests
+    - /etc/kubernetes/pki
+    - /var/lib/etcd
+    - /var/lib/kubelet
+    - /var/lib/containers
+    - /var/lib/crio
+  ignore_errors: yes
+
+- name: Recreate CRI and container directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: 0755
+  loop:
+    - /var/lib/containers
+    - /var/lib/crio
+
+- name: Start CRI-O and kubelet
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: started
+    enabled: yes
+  loop:
+    - crio
+    - kubelet
+
+- name: Pull Kubernetes pause image
+  ansible.builtin.command: >
+    crictl --runtime-endpoint unix:///var/run/crio/crio.sock pull registry.k8s.io/pause:3.9
+  ignore_errors: yes
+
+# --------------------------------------------------------------------
+# Generate join command and upload certs only on the first master (cp1)
+# --------------------------------------------------------------------
+- name: Wait for master API /healthz to return OK
+  uri:
+    url: "https://{{ hostvars[groups['masters'][0]].ansible_host }}:6443/healthz"
+    method: GET
+    validate_certs: no
+  register: healthz_check
+  until: healthz_check.status == 200
+  retries: 20
+  delay: 10
+  delegate_to: "{{ groups['masters'][0] }}"
+  run_once: true
+
+- name: Generate join command on the first master
+  ansible.builtin.shell: kubeadm token create --print-join-command
+  register: join_cmd_out
+  delegate_to: "{{ groups['masters'][0] }}"
+  run_once: true
+
+- name: Upload certs on the first master
+  ansible.builtin.shell: kubeadm init phase upload-certs --upload-certs | tail -1
+  register: cert_key_out
+  delegate_to: "{{ groups['masters'][0] }}"
+  run_once: true
+
+# --------------------------------------------------------------------
+# (CORRECTED) Set and Distribute join vars to all hosts in the play
+# --------------------------------------------------------------------
+- name: Set and distribute join command and cert key to all hosts
+  ansible.builtin.set_fact:
+    join_command: "{{ hostvars[ansible_play_hosts[0]].join_cmd_out.stdout | trim }}"
+    cert_key: "{{ hostvars[ansible_play_hosts[0]].cert_key_out.stdout | trim }}"
+
+# --------------------------------------------------------------------
+# Join Nodes to Cluster
+# --------------------------------------------------------------------
+
+- name: Join control-plane nodes (cp2, cp3)
+  ansible.builtin.shell: "{{ join_command }} --control-plane --certificate-key {{ cert_key }}"
+  when: inventory_hostname in groups['masters'] and inventory_hostname != groups['masters'][0]
+  register: cp_join_result
+  changed_when: "'This node has joined the cluster' in cp_join_result.stdout"
+  ignore_errors: yes
+
+- name: Join worker nodes
+  ansible.builtin.shell: "{{ join_command }}"
+  when: inventory_hostname in groups['workers']
+  register: worker_join_result
+  changed_when: "'This node has joined the cluster' in worker_join_result.stdout"
+  ignore_errors: yes

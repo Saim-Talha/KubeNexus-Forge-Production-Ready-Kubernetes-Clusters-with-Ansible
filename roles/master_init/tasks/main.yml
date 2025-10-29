@@ -1,0 +1,76 @@
+---
+- name: Stop kubelet service if running
+  ansible.builtin.service:
+    name: kubelet
+    state: stopped
+  ignore_errors: yes
+
+- name: Kill leftover Kubernetes control plane processes
+  ansible.builtin.shell: |
+    pkill -9 kube-apiserver kube-controller-manager kube-scheduler etcd || true
+  ignore_errors: yes
+
+- name: Wait for all critical ports to be free
+  ansible.builtin.shell: |
+    for port in 10257 10259 6443 2379 2380; do
+      if ss -ltnp | grep -q ":$port"; then
+        pid=$(ss -ltnp | grep ":$port" | awk -F',' '{print $2}' | awk '{print $1}')
+        if [ -n "$pid" ]; then
+          kill -9 $pid || true
+        fi
+      fi
+    done
+  ignore_errors: yes
+
+- name: Reset Kubernetes components
+  ansible.builtin.shell: |
+    kubeadm reset -f
+    rm -rf /etc/kubernetes /var/lib/etcd /var/lib/kubelet /etc/cni/net.d /var/lib/cni
+  ignore_errors: yes
+
+- name: Reload systemd
+  ansible.builtin.shell: systemctl daemon-reexec && systemctl daemon-reload
+
+- name: Generate kubeadm init config without template
+  ansible.builtin.copy:
+    dest: /etc/kubeadm_init.yaml
+    content: |
+      apiVersion: kubeadm.k8s.io/v1beta3
+      kind: InitConfiguration
+      localAPIEndpoint:
+        advertiseAddress: {{ k8s_control_plane_ip }}
+        bindPort: 6443
+      ---
+      apiVersion: kubeadm.k8s.io/v1beta3
+      kind: ClusterConfiguration
+      kubernetesVersion: {{ k8s_version }}
+      controlPlaneEndpoint: "{{ k8s_api_endpoint_ip }}:6443"
+      networking:
+        podSubnet: "{{ k8s_pod_network_cidr }}"
+    mode: '0644'
+
+- name: Initialize Kubernetes control plane
+  ansible.builtin.shell: |
+    kubeadm init --config=/etc/kubeadm_init.yaml --upload-certs --ignore-preflight-errors=Port-10257,Port-10259 --v=9
+  args:
+    creates: /etc/kubernetes/admin.conf
+
+- name: Ensure .kube directory exists for root
+  ansible.builtin.file:
+    path: /root/.kube
+    state: directory
+    mode: "0755"
+
+- name: Copy admin.conf for kubectl
+  ansible.builtin.copy:
+    src: /etc/kubernetes/admin.conf
+    dest: /root/.kube/config
+    remote_src: yes
+    mode: "0600"
+
+- name: Restart kubelet service
+  ansible.builtin.service:
+    name: kubelet
+    state: restarted
+    enabled: yes
+

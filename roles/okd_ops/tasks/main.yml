@@ -1,0 +1,45 @@
+---
+- name: Download OKD client (oc + kubectl)
+  ansible.builtin.get_url:
+    url: "https://github.com/okd-project/okd/releases/download/4.20.0-okd-scos.6/openshift-client-linux-amd64-rhel9-4.20.0-okd-scos.6.tar.gz"
+    dest: "/tmp/oc-client.tar.gz"
+    mode: '0644'
+
+- name: Extract OKD client binaries
+  ansible.builtin.unarchive:
+    src: "/tmp/oc-client.tar.gz"
+    dest: "/tmp/"
+    remote_src: true
+
+- name: Move oc binary to /usr/local/bin
+  ansible.builtin.copy:
+    src: "/tmp/oc"
+    dest: "/usr/local/bin/oc"
+    mode: '0755'
+    remote_src: true
+
+- name: Move kubectl binary to /usr/local/bin
+  ansible.builtin.copy:
+    src: "/tmp/kubectl"
+    dest: "/usr/local/bin/kubectl"
+    mode: '0755'
+    remote_src: true
+
+- name: Ensure oc and kubectl are executable
+  ansible.builtin.file:
+    path: "{{ item }}"
+    mode: '0755'
+    state: file
+  loop:
+    - /usr/local/bin/oc
+    - /usr/local/bin/kubectl
+
+- name: Verify oc client installation
+  ansible.builtin.command: oc version --client
+  register: oc_client_output
+  changed_when: false
+
+- name: Display oc client version
+  ansible.builtin.debug:
+    msg: "{{ oc_client_output.stdout }}"
+
